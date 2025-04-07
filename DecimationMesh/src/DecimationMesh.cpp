@@ -3,6 +3,18 @@
 #include <Eigen/SVD>
 #include <queue>
 typedef std::map<MyMesh::EdgeHandle, std::set<MyMesh::FaceHandle>> PlaneV;
+
+struct DecimationMesh::CostEdge
+{
+	MyMesh::EdgeHandle edge;
+	MyMesh::VertexHandle v0;
+	MyMesh::VertexHandle v1;
+	double cost;
+	bool operator>(const CostEdge& other) const
+	{
+		return cost > other.cost;
+	}
+};
 class DecimationMesh::PImpl
 {
 public:
@@ -32,9 +44,10 @@ public:
 	std::set<MyMesh::FaceHandle> getPlaneSet(MyMesh::EdgeHandle e_it);
 	Eigen::MatrixXd getPlaneFunction(MyMesh::FaceHandle face);//获取法向归一化的平面方程
 	void applyContraction();
-	void getVerEdgeCost(MyMesh::EdgeHandle e_it, float& cost);
+	void applyContraction2();
+	void getVerEdgeCost(CostEdge& ct);
 	Eigen::MatrixXd pseudoInverse(Eigen::MatrixXd mat);
-	bool isLegalCollapseEdge(MyMesh::EdgeHandle edge, MyMesh::VertexHandle& v0, MyMesh::VertexHandle& v1);
+	bool isLegalCollapseEdge(CostEdge& ct);
 };
 
 DecimationMesh::DecimationMesh()
@@ -123,13 +136,13 @@ Eigen::MatrixXd DecimationMesh::PImpl::getPlaneFunction(MyMesh::FaceHandle face)
 	double x0, y0, z0 = 0.0;
 	MyMesh::Normal n = mesh_.calc_face_normal(face);
 	double length = n.norm();
-	/*if (length > 1e-6) 
-	{ 
-		n /= length; 
-	}
-	else 
+	/*if (length > 1e-6)
 	{
-		n = MyMesh::Normal(0.0, 0.0, 1.0); 
+		n /= length;
+	}
+	else
+	{
+		n = MyMesh::Normal(0.0, 0.0, 1.0);
 	}*/
 	MyMesh::FaceVertexIter fv_it = mesh_.fv_iter(face);
 	MyMesh::Point point = mesh_.point(*fv_it);
@@ -151,12 +164,9 @@ Eigen::MatrixXd DecimationMesh::PImpl::getPlaneFunction(MyMesh::FaceHandle face)
 
 void DecimationMesh::PImpl::applyContraction()
 {
-	std::set<std::pair<double, MyMesh::EdgeHandle>> contraction_cost;
+	std::priority_queue<CostEdge, std::vector<CostEdge>, std::greater<CostEdge> > small_heap;
 	for (auto e_it = mesh_.edges_begin(); e_it != mesh_.edges_end(); ++e_it)
 	{
-		//float edge_length = mesh_.calc_edge_length(*e_it);
-		//if (edge_length >= t_ * avg_edge_length_ || e_it->is_boundary())//边界保护和特征保护
-
 		MyMesh::HalfedgeHandle h0 = mesh_.halfedge_handle(*e_it, 0);
 		if (!mesh_.is_valid_handle(h0))
 		{
@@ -166,136 +176,69 @@ void DecimationMesh::PImpl::applyContraction()
 		{
 			continue;
 		}
-		MyMesh::VertexHandle v0 = mesh_.from_vertex_handle(h0);
-		MyMesh::VertexHandle v1 = mesh_.to_vertex_handle(h0);
-
-		if(e_it->is_boundary() || mesh_.is_boundary(v0) || mesh_.is_boundary(v1))
-			continue;
-		float cur_cost = FLT_MAX;
-		getVerEdgeCost(*e_it, cur_cost);
-		//std::cout << "VerEdgeCost:" << cur_cost << std::endl;
-		contraction_cost.insert(std::make_pair(cur_cost, *e_it));
+		CostEdge ct;
+		ct.edge = *e_it;
+		ct.v0 = mesh_.from_vertex_handle(h0);;
+		ct.v1 = mesh_.to_vertex_handle(h0);
+		ct.cost = FLT_MAX;
+		getVerEdgeCost(ct);
+		small_heap.push(ct);
 	}
+
 	OpenMesh::IO::write_mesh(pairMesh_, "D:/data/Decimation/pairMesh_.obj");
 	int vert_num = mesh_.n_vertices();
-	while (contraction_cost.size() != 0 && mesh_.n_vertices() > vert_number_limit_)
+	while (!small_heap.empty() && vert_num > vert_number_limit_)
 	{
-		int vert_num = mesh_.n_vertices();
-		auto it = contraction_cost.begin();
-		MyMesh pointMesh;
-		while (it != contraction_cost.end())
+		auto ct = small_heap.top();
+		small_heap.pop();
+		if (!ct.edge.is_valid() || !ct.v0.is_valid() || !ct.v1.is_valid())
 		{
-			//判断是否合法塌缩边
-			MyMesh::VertexHandle v0;
-			MyMesh::VertexHandle v1;
-			if (!isLegalCollapseEdge(it->second, v0, v1))
-			{
-				it++;
-				continue;
-			}
-
-			MyMesh::Point new_v = v_bar_[it->second];
-			pointMesh.add_vertex(new_v);
-
-			//查找领域
-			std::vector<MyMesh::VertexHandle> neighbors;
-			for (auto f_it = mesh_.vf_iter(v0); f_it.is_valid(); ++f_it)
-			{
-				for (auto h_it = mesh_.fh_iter(*f_it); h_it.is_valid(); ++h_it)
-				{
-					MyMesh::VertexHandle to_v = mesh_.to_vertex_handle(*h_it);
-					MyMesh::VertexHandle from_v = mesh_.from_vertex_handle(*h_it);
-					if (to_v != v0 && from_v != v0 && to_v != v1 && from_v != v1)
-					{
-						neighbors.push_back(from_v);
-						neighbors.push_back(to_v);
-						break;
-					}
-				}
-			}
-			for (auto f_it = mesh_.vf_iter(v1); f_it.is_valid(); ++f_it)
-			{
-				for (auto h_it = mesh_.fh_iter(*f_it); h_it.is_valid(); ++h_it)
-				{
-					MyMesh::VertexHandle to_v = mesh_.to_vertex_handle(*h_it);
-					MyMesh::VertexHandle from_v = mesh_.from_vertex_handle(*h_it);
-					if (to_v != v0 && from_v != v0 && to_v != v1 && from_v != v1)
-					{
-						neighbors.push_back(from_v);
-						neighbors.push_back(to_v);
-						break;
-					}
-				}
-			}
-			//删除边
-			std::set<MyMesh::EdgeHandle> delete_edges;
-			for (auto e_it = mesh_.ve_iter(v0); e_it.is_valid(); ++e_it)
-			{
-				delete_edges.insert(*e_it);//迭代器并不会自动适应动态修改的网格结构
-			}
-			for (auto e_it = mesh_.ve_iter(v1); e_it.is_valid(); ++e_it)
-			{
-				delete_edges.insert(*e_it);
-			}
-
-			for (auto e_it : delete_edges)
-			{
-				mesh_.delete_edge(e_it);
-			}
-
-			MyMesh::VertexHandle vbar = mesh_.add_vertex(new_v);
-			int num_N = (int)neighbors.size();
-			for (int i = 0; i < num_N - 1; i += 2)
-			{
-				auto from_vertex = neighbors[i];
-				auto to_vertex = neighbors[(i + 1) % num_N];
-				mesh_.add_face(vbar, from_vertex, to_vertex);
-			}
-
-			mesh_.delete_vertex(v0);
-			mesh_.delete_vertex(v1);
-			
-			it++;
-			vert_num--;
-			std::cout << "vertices number:" << vert_num << std::endl;
-			if (vert_num <= vert_number_limit_)
-			{
-				break;
-			}
+			continue;
 		}
-		mesh_.garbage_collection();
-		/*OpenMesh::IO::write_mesh(mesh_, "D:/data/Decimation/output.obj");
-		OpenMesh::IO::write_mesh(pointMesh, "D:/data/Decimation/pointMesh.obj");
-		OpenMesh::IO::write_mesh(pairMesh_, "D:/data/Decimation/pairMesh.obj");*/
-		contraction_cost.clear();
-		for (auto e_it = mesh_.edges_begin(); e_it != mesh_.edges_end(); ++e_it)
+		if (!isLegalCollapseEdge(ct))
 		{
-			MyMesh::HalfedgeHandle h0 = mesh_.halfedge_handle(*e_it, 0);
+			continue;
+		}
+		//mesh_.request_vertex_status();
+		//mesh_.request_edge_status();
+		//mesh_.request_face_status();
+		MyMesh::Point new_v = v_bar_[ct.edge];
+		MyMesh::HalfedgeHandle heh0 = mesh_.halfedge_handle(ct.edge, 0);
+		if (!mesh_.is_collapse_ok(heh0))
+			continue;
+		MyMesh::VertexHandle v_keep = mesh_.to_vertex_handle(heh0);
+		mesh_.collapse(heh0);
+		mesh_.set_point(v_keep, new_v);
+		vert_num--;
+		for (auto ve_it = mesh_.ve_iter(v_keep); ve_it.is_valid(); ++ve_it)
+		{
+			MyMesh::HalfedgeHandle h0 = mesh_.halfedge_handle(*ve_it, 0);
 			if (!mesh_.is_valid_handle(h0))
 			{
-				h0 = mesh_.halfedge_handle(*e_it, 1);
+				h0 = mesh_.halfedge_handle(*ve_it, 1);
 			}
 			if (!mesh_.is_valid_handle(h0))
 			{
 				continue;
 			}
-			MyMesh::VertexHandle v0 = mesh_.from_vertex_handle(h0);
-			MyMesh::VertexHandle v1 = mesh_.to_vertex_handle(h0);
-
-			if (e_it->is_boundary() || mesh_.is_boundary(v0) || mesh_.is_boundary(v1))
-				continue;
-			float cur_cost = FLT_MAX;
-			getVerEdgeCost(*e_it, cur_cost);
-			contraction_cost.insert(std::make_pair(cur_cost, *e_it));
+			CostEdge ct;
+			ct.edge = *ve_it;
+			ct.v0 = mesh_.from_vertex_handle(h0);;
+			ct.v1 = mesh_.to_vertex_handle(h0);
+			ct.cost = FLT_MAX;
+			getVerEdgeCost(ct);
+			small_heap.push(ct);
 		}
-		//OpenMesh::IO::write_mesh(mesh_, "D:/data/Decimation/output.obj");
 	}
+	mesh_.garbage_collection();
 	OpenMesh::IO::write_mesh(mesh_, "D:/data/Decimation/output.obj");
-	//OpenMesh::IO::write_mesh(pairMesh_, "D:/data/Decimation/pairMesh_.obj");
 }
 
-void DecimationMesh::PImpl::getVerEdgeCost(MyMesh::EdgeHandle e_it, float& cost)
+
+void DecimationMesh::PImpl::getVerEdgeCost(CostEdge& ct)
 {
+	if (mesh_.is_boundary(ct.edge) || mesh_.is_boundary(ct.v0) || mesh_.is_boundary(ct.v1))
+		ct.cost = FLT_MAX;
 	//收缩
 	Eigen::MatrixXd QMat(4, 4);
 	Eigen::MatrixXd zeroV(4, 1);
@@ -306,7 +249,7 @@ void DecimationMesh::PImpl::getVerEdgeCost(MyMesh::EdgeHandle e_it, float& cost)
 	zeroV.setZero();
 	zeroV(3, 0) = 1;
 
-	std::set<MyMesh::FaceHandle> plane_set = getPlaneSet(e_it);
+	std::set<MyMesh::FaceHandle> plane_set = getPlaneSet(ct.edge);
 	for (auto f_it : plane_set)
 	{
 		Eigen::MatrixXd pVector(4, 1);
@@ -321,20 +264,18 @@ void DecimationMesh::PImpl::getVerEdgeCost(MyMesh::EdgeHandle e_it, float& cost)
 	}
 	else
 	{
-		MyMesh::HalfedgeHandle half_edge = mesh_.halfedge_handle(e_it, 0);
-		MyMesh::Point v0 = mesh_.point(mesh_.from_vertex_handle(half_edge));
-		MyMesh::Point v1 = mesh_.point(mesh_.to_vertex_handle(half_edge));
+		MyMesh::Point v0 = mesh_.point(ct.v0);
+		MyMesh::Point v1 = mesh_.point(ct.v1);
 		MyMesh::Point mid_point = (v0 + v1) * 0.5;
 		vBar(0, 0) = mid_point[0];
 		vBar(1, 0) = mid_point[1];
 		vBar(2, 0) = mid_point[2];
 		vBar(3, 0) = 1;
 	}
-	v_bar_[e_it] = MyMesh::Point{ vBar(0, 0), vBar(1, 0), vBar(2, 0) };
+	v_bar_[ct.edge] = MyMesh::Point{ vBar(0, 0), vBar(1, 0), vBar(2, 0) };
 
-	MyMesh::HalfedgeHandle half_edge = mesh_.halfedge_handle(e_it, 0);
-	MyMesh::Point v0 = mesh_.point(mesh_.from_vertex_handle(half_edge));
-	MyMesh::Point v1 = mesh_.point(mesh_.to_vertex_handle(half_edge));
+	MyMesh::Point v0 = mesh_.point(ct.v0);
+	MyMesh::Point v1 = mesh_.point(ct.v1);
 	//std::cout <<"V0" << "X:" << v0[0] << "Y:" << v0[1] << "Z:" << v0[2] << std::endl;
 	//std::cout <<"V1" << "X:" << v1[0] << "Y:" << v1[1] << "Z:" << v1[2] << std::endl;
 	std::cout << "VBar" << "X:" << vBar(0, 0) << "Y:" << vBar(1, 0) << "Z:" << vBar(2, 0) << "T:" << vBar(3, 0) << std::endl;
@@ -342,10 +283,10 @@ void DecimationMesh::PImpl::getVerEdgeCost(MyMesh::EdgeHandle e_it, float& cost)
 	int vertex_num = pairMesh_.n_vertices();
 	MyMesh::VertexHandle vh0 = pairMesh_.add_vertex(v0);
 	MyMesh::VertexHandle vh1 = pairMesh_.add_vertex(v1);
-	MyMesh::VertexHandle vh2 = pairMesh_.add_vertex(v_bar_[e_it]);
+	MyMesh::VertexHandle vh2 = pairMesh_.add_vertex(v_bar_[ct.edge]);
 	pairMesh_.add_face(vh0, vh1, vh2);
 
-	cost = (vBar.transpose() * QMat * vBar)(0, 0);
+	ct.cost = (vBar.transpose() * QMat * vBar)(0, 0);
 }
 
 Eigen::MatrixXd DecimationMesh::PImpl::pseudoInverse(Eigen::MatrixXd mat)
@@ -363,33 +304,21 @@ Eigen::MatrixXd DecimationMesh::PImpl::pseudoInverse(Eigen::MatrixXd mat)
 	return svd.matrixV() * singularValuesInv.asDiagonal() * svd.matrixU().transpose();
 }
 
-bool DecimationMesh::PImpl::isLegalCollapseEdge(MyMesh::EdgeHandle edge, MyMesh::VertexHandle& v0, MyMesh::VertexHandle& v1)
+bool DecimationMesh::PImpl::isLegalCollapseEdge(CostEdge& ct)
 {
-	if (!edge.is_valid())
+	if (!ct.edge.is_valid())
 	{
 		return false;
 	}
 	//判断是否合法塌缩边
-	MyMesh::HalfedgeHandle h0 = mesh_.halfedge_handle(edge, 0);
-	if (!mesh_.is_valid_handle(h0))
-	{
-		h0 = mesh_.halfedge_handle(edge, 1);
-	}
-	if (!mesh_.is_valid_handle(h0))
-	{
-		return false;
-	}
-
-	v0 = mesh_.from_vertex_handle(h0);
-	v1 = mesh_.to_vertex_handle(h0);
 	std::vector<MyMesh::VertexHandle> all_Vertex;
 	std::set<MyMesh::VertexHandle> ring_Vertex;
-	for (auto vv_it = mesh_.vv_iter(v0); vv_it.is_valid(); vv_it++)
+	for (auto vv_it = mesh_.vv_iter(ct.v0); vv_it.is_valid(); vv_it++)
 	{
 		ring_Vertex.insert(*vv_it);
 		all_Vertex.push_back(*vv_it);
 	}
-	for (auto vv_it = mesh_.vv_iter(v1); vv_it.is_valid(); vv_it++)
+	for (auto vv_it = mesh_.vv_iter(ct.v1); vv_it.is_valid(); vv_it++)
 	{
 		ring_Vertex.insert(*vv_it);
 		all_Vertex.push_back(*vv_it);

@@ -34,6 +34,7 @@ public:
 	void applyDecimation();
 	MyMesh getMesh();
 private:
+	struct CostEdge;
 	class PImpl;
 	std::shared_ptr<PImpl> impl_;
 };
